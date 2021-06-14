@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: LINEWORKS Twitter
+
+Parameters:
+  PJPrefix:
+    Type: String
+    Default: kensho-senkennews
+  LWAPIKEY:
+     Type: String
+  LWBOTID:
+     Type: String
+  LWCONSUMERKEY:
+     Type: String
+  LWROOMID:
+     Type: String
+  LWSERVERID:
+     Type: String
+  LWSERVERKEYBUCKET:
+     Type: String
+  TWITTERACCESSTOKEN:
+     Type: String
+  TWITTERACCESSTOKENSECRET:
+     Type: String
+  TWITTERCONSUMERKEY:
+     Type: String
+  TWITTERCONSUMERSECRET:
+     Type: String
+  TWITTERMAXCOUNT:
+     Type: String
+  TWITTERSCREENNAME:
+     Type: String
+
+Resources:
+  LambdaLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: !Ref LWSERVERKEYBUCKET
+        S3Key: lwpython.zip #Layer File
+      Description: LINEWORKS Twitter
+      LayerName: !Sub "${PJPrefix}-layer"
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Sub ${PJPrefix}-keypolicy
+        Statement:
+          -
+            Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "*"
+            Resource: "*"
+          -
+            Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  #Lambda
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLayer
+    Properties:
+      FunctionName: !Sub "${PJPrefix}-lambda"
+      Handler: index.handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 20
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import requests
+          import urllib
+          import datetime
+          import urllib.parse
+          import tweepy
+          import jwt
+          import boto3
+          from base64 import b64decode
+
+
+          def get_jwt():
+              timestamp = datetime.datetime.now().timestamp()
+              jwt_token = jwt.encode(
+                  {
+                      "iss": decrypt(os.environ['LW_SERVER_ID']),
+                      "iat": timestamp,
+                      "exp": timestamp + 3600
+                  },
+                  boto3.resource('s3').Bucket(os.environ['LW_SERVER_KEY_BUCKET']).Object('lwlambda.key').get()[
+                    'Body'].read().decode('utf-8'),
+                  algorithm="RS256")
+              return jwt_token
+
+
+          def get_token():
+              headers = {
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+              }
+              form_data = {
+                  "grant_type": urllib.parse.quote("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                  "assertion": get_jwt()
+              }
+              r = requests.post(url='https://authapi.worksmobile.com/b/' + decrypt(os.environ['LW_API_KEY']) + '/server/token',
+                                data=form_data,
+                                headers=headers)
+              body = json.loads(r.text)
+              return body["access_token"]
+
+
+          def post_lw_tweets():
+              url = 'https://apis.worksmobile.com/r/%s/message/v1/bot/%s/message/push' % (
+                  decrypt(os.environ['LW_API_KEY']), os.environ['LW_BOT_ID'])
+              headers = {
+                  'Content-Type': 'application/json; charset=UTF-8',
+                  'consumerKey': decrypt(os.environ['LW_CONSUMER_KEY']),
+                  'Authorization': ('Bearer %s' % get_token())
+              }
+              payload = {
+                  'roomId': os.environ['LW_ROOM_ID'],
+                  'content': {
+                      'type': 'text',
+                      'text': get_tweets()
+                  }
+              }
+
+              result = requests.post(url, data=json.dumps(payload), headers=headers)
+              print(result.text)
+
+              return result.status_code
+
+
+          def get_tweets():
+              auth = tweepy.OAuthHandler(decrypt(os.environ['TWITTER_CONSUMER_KEY']),
+                                         decrypt(os.environ['TWITTER_CONSUMER_SECRET']))
+              auth.set_access_token(decrypt(os.environ['TWITTER_ACCESS_TOKEN']),
+                                    decrypt(os.environ['TWITTER_ACCESS_TOKEN_SECRET']))
+              api = tweepy.API(auth)
+
+              tweets = api.user_timeline(include_rts=False,
+                                         screen_name=os.environ['TWITTER_SCREEN_NAME'],
+                                         count=int(os.environ['TWITTER_MAX_COUNT']))
+              tweets.reverse()  # 降順にする
+              yesterday = datetime.datetime.now() + datetime.timedelta(days=-1)  # 昨日
+              tw_str = '【' + os.environ['TWITTER_SCREEN_NAME'] + datetime.datetime.now().strftime(' %m/%d') + 'のニュース】\n\n'
+              for tweet in tweets:
+
+                  tw_time = tweet.created_at + datetime.timedelta(hours=9)  # UTC→JST
+
+                  if tw_time < yesterday:
+                      # 昨日以前は不要
+                      continue
+
+                  tw_str += tw_time.strftime('%m/%d %H:%M')
+
+                  lines = tweet.text.split('\n')  # 改行で分ける
+                  for i in range(0, len(lines)):  # 多分一番最後の行は不要
+                      line = lines[i]
+                      if line == '':
+                          continue
+                      if line[0:1] == '#':  # ハッシュタグ行は見ない
+                          continue
+                      tw_str += ' ' + lines[i]
+                  tw_str += '\n\n'
+              return tw_str.strip()
+
+
+          def decrypt(enc):
+              return boto3.client('kms').decrypt(
+                  CiphertextBlob=b64decode(enc),
+                  EncryptionContext={'LambdaFunctionName': os.environ['AWS_LAMBDA_FUNCTION_NAME']}
+              )['Plaintext'].decode('utf-8')
+
+
+          def handler(event, context):
+              return post_lw_tweets()
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          LW_API_KEY: !Ref LWAPIKEY
+          LW_CONSUMER_KEY: !Ref LWCONSUMERKEY
+          LW_ROOM_ID: !Ref LWROOMID
+          LW_BOT_ID: !Ref LWBOTID
+          LW_SERVER_ID: !Ref LWSERVERID
+          LW_SERVER_KEY_BUCKET: !Ref LWSERVERKEYBUCKET
+          TWITTER_CONSUMER_KEY: !Ref TWITTERCONSUMERKEY
+          TWITTER_CONSUMER_SECRET: !Ref TWITTERCONSUMERSECRET
+          TWITTER_ACCESS_TOKEN: !Ref TWITTERACCESSTOKEN
+          TWITTER_ACCESS_TOKEN_SECRET: !Ref TWITTERACCESSTOKENSECRET
+          TWITTER_MAX_COUNT: !Ref TWITTERMAXCOUNT
+          TWITTER_SCREEN_NAME: !Ref TWITTERSCREENNAME
+
+
+  #========================================
+  # IAM
+  #========================================
+  # Lambda実行ロール
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${PJPrefix}-LambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  # Lambda実行ロールのポリシー
+  LambdaExecutionPolicy:
+    Type: "AWS::IAM::Policy"
+    DependsOn: LambdaExecutionRole
+    Properties:
+      PolicyName: !Sub "${PJPrefix}-LambdaPolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: "Allow"
+            Action:
+              - lambda:GetLayerVersion
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${LWSERVERKEYBUCKET}/*"
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "cron(0 23 * * ? *)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - "LambdaFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"

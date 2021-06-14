@@ -1,0 +1,4 @@
+PyJWT
+requests
+tweepy
+boto3
