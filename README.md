@@ -24,6 +24,8 @@
     - Botポリシー チーム/グループ/1:Nトークに招待可
 1. S3に Server Token をファイル名を `lwlambda.key` に変更してアップロードする.
    - アップロードしたbucketは `LWSERVERKEYBUCKET` としてCFnで使用する。
+1. 作成したBotをトークルームに招待する.
+1. 招待したトークルームのroomidを取得する(後で使う).
 
 ### layer 作成
 1. Pythonを3.8にする.
